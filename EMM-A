@@ -21,6 +21,7 @@
 // SPEEDB <value> : sets backing-out speed (m/s)
 // MINEH <value> : sets miner lane height footprint (m)
 // MINEW <value> : sets miner lane width footprint (m)
+// DEPTHMODE <DEFAULT|ORE|ORESTONE> : depth behavior (fixed depth, auto stop on ore depletion, auto incl. stone)
 // TOFF r,u,f : sets target offset in local Right,Up,Forward meters
 // TOFFRESET : clears target offset
 // =====================================
@@ -54,6 +55,23 @@ double SPEEDB = 6.0; // backing-out speed (m/s)
 double activeMaxSpeed = 0;
 double MINEH = 7.5; // miner lane height footprint (m)
 double MINEW = 7.5; // miner lane width footprint (m)
+enum DepthMode
+{
+    Default,
+    Ore,
+    OrePlusStone
+}
+DepthMode depthMode = DepthMode.Default;
+double lastOreSnapshot = 0;
+double lastOreGainDepth = 0;
+int noOreGainTicks = 0;
+const int noOreGainTickLimit = 20;
+const double autoDepthNoGainMeters = 2.0;
+// Keep the forward point far away in auto-depth modes so position-control slowdown
+// doesn't kick in too early and accidentally trigger stuck protection.
+const double autoDepthExtraCap = 2000.0;
+int oreSampleTickCounter = 0;
+const int oreSampleIntervalTicks = 6;
 double TOFFR = 0; // target offset Right (m)
 double TOFFU = 0; // target offset Up (m)
 double TOFFF = 0; // target offset Forward (m)
@@ -148,6 +166,7 @@ void WriteEcho()
     sb.AppendLine($"SPEEDF: {SPEEDF:0.00} m/s");
     sb.AppendLine($"SPEEDB: {SPEEDB:0.00} m/s");
     sb.AppendLine($"MINEH/MINEW: {MINEH:0.00}/{MINEW:0.00} m");
+    sb.AppendLine($"Depth mode: {depthMode}");
     sb.AppendLine($"TOFF R/U/F: {TOFFR:0.00}/{TOFFU:0.00}/{TOFFF:0.00} m");
     if (areaMiningMode && areaLaneAnchors.Count > 0)
         sb.AppendLine($"Area lane: {areaLaneIndex + 1}/{areaLaneAnchors.Count}");
@@ -188,6 +207,19 @@ void Move ()
         thrust.Reset();
         if (aligned)
             gyros.Reset();
+        return;
+    }
+
+    if (miningEnabled && miningState == MiningState.DrillForward)
+    {
+        Vector3D velDir = desiredForward;
+        if (velDir.LengthSquared() > 0.001)
+            velDir = Vector3D.Normalize(velDir);
+        else
+            velDir = rc.WorldMatrix.Forward;
+
+        double drillSpeed = activeMaxSpeed > 0 ? activeMaxSpeed : SPEEDF;
+        thrust.ApplyAccel(thrust.ControlVelocity(velDir * drillSpeed));
         return;
     }
 
@@ -289,6 +321,23 @@ void RemoteCommand (string command)
         }
         else
             Echo("Invalid MINEW value.");
+        return;
+    }
+    if (trimmed.StartsWith("DEPTHMODE ", StringComparison.OrdinalIgnoreCase))
+    {
+        string mode = trimmed.Substring(10).Trim().ToUpperInvariant();
+        if (mode == "DEFAULT")
+            depthMode = DepthMode.Default;
+        else if (mode == "ORE")
+            depthMode = DepthMode.Ore;
+        else if (mode == "ORESTONE")
+            depthMode = DepthMode.OrePlusStone;
+        else
+        {
+            Echo("Invalid DEPTHMODE. Use DEFAULT, ORE, or ORESTONE.");
+            return;
+        }
+        Echo($"DEPTHMODE set to {depthMode}");
         return;
     }
     if (trimmed.StartsWith("TOFF ", StringComparison.OrdinalIgnoreCase))
@@ -407,6 +456,7 @@ void StartSingleLaneMining(string command)
     autopilotEnabled = true;
     miningEnabled = true;
     miningState = MiningState.EnterLane;
+    ResetDepthAutoTracker();
     Echo($"Mining lane started. Depth={laneDepth:0.00}m");
 }
 
@@ -475,6 +525,7 @@ void StartAreaMining(string command)
     autopilotEnabled = true;
     miningEnabled = true;
     miningState = MiningState.EnterLane;
+    ResetDepthAutoTracker();
 
     Echo($"Area mining started. Lanes={areaLaneAnchors.Count}, depth={laneDepth:0.00}m");
 }
@@ -574,11 +625,12 @@ void UpdateMiningState()
             {
                 SetDrills(true);
                 ResetStuckMonitor();
+                ResetDepthAutoTracker();
                 miningState = MiningState.DrillForward;
             }
             break;
         case MiningState.DrillForward:
-            targetPosition = laneAnchor + drillAxis * laneDepth;
+            targetPosition = laneAnchor + drillAxis * GetLaneTargetDepth();
             desiredForward = drillAxis;
             activeMaxSpeed = SPEEDF;
             if (CheckStuckInLane())
@@ -587,7 +639,7 @@ void UpdateMiningState()
                 miningState = MiningState.Backout;
                 Echo("Stuck detected. Returning to anchor and retrying lane.");
             }
-            else if (IsAtTargetPosition(targetPosition))
+            else if (ShouldFinishDrillForward())
                 miningState = MiningState.Backout;
             break;
         case MiningState.Backout:
@@ -608,6 +660,7 @@ void UpdateMiningState()
                 {
                     areaLaneIndex++;
                     laneAnchor = areaLaneAnchors[areaLaneIndex];
+                    ResetDepthAutoTracker();
                     miningState = MiningState.EnterLane;
                     Echo($"Proceeding to lane {areaLaneIndex + 1}/{areaLaneAnchors.Count}");
                 }
@@ -631,6 +684,88 @@ void ResetStuckMonitor()
 {
     stuckSamplePos = rc.GetPosition();
     stuckNoMoveSeconds = 0;
+}
+
+void ResetDepthAutoTracker()
+{
+    lastOreSnapshot = GetOreAmount(depthMode == DepthMode.OrePlusStone);
+    lastOreGainDepth = 0;
+    noOreGainTicks = 0;
+    oreSampleTickCounter = 0;
+}
+
+double GetLaneProgressDepth()
+{
+    return Math.Max(0, Vector3D.Dot(rc.GetPosition() - laneAnchor, drillAxis));
+}
+
+double GetLaneTargetDepth()
+{
+    if (depthMode == DepthMode.Default)
+        return laneDepth;
+    return laneDepth + autoDepthExtraCap;
+}
+
+bool ShouldFinishDrillForward()
+{
+    double depthProgress = GetLaneProgressDepth();
+    if (depthMode == DepthMode.Default)
+        return depthProgress >= laneDepth || IsAtTargetPosition(targetPosition);
+
+    oreSampleTickCounter++;
+    if (oreSampleTickCounter >= oreSampleIntervalTicks)
+    {
+        oreSampleTickCounter = 0;
+        bool includeStone = depthMode == DepthMode.OrePlusStone;
+        double oreNow = GetOreAmount(includeStone);
+
+        if (oreNow > lastOreSnapshot + 0.01)
+        {
+            lastOreSnapshot = oreNow;
+            lastOreGainDepth = depthProgress;
+            noOreGainTicks = 0;
+        }
+        else if (depthProgress >= laneDepth && (depthProgress - lastOreGainDepth) >= autoDepthNoGainMeters)
+        {
+            noOreGainTicks++;
+        }
+    }
+
+    if (depthProgress >= laneDepth + autoDepthExtraCap)
+        return true;
+
+    return depthProgress >= laneDepth && noOreGainTicks >= noOreGainTickLimit;
+}
+
+double GetOreAmount(bool includeStone)
+{
+    double total = 0;
+    List<MyInventoryItem> items = new List<MyInventoryItem>();
+    foreach (var drill in drills)
+    {
+        if (drill == null || !drill.IsFunctional)
+            continue;
+
+        int invCount = drill.InventoryCount;
+        for (int i = 0; i < invCount; i++)
+        {
+            var inv = drill.GetInventory(i);
+            if (inv == null)
+                continue;
+            items.Clear();
+            inv.GetItems(items);
+            foreach (var item in items)
+            {
+                if (!string.Equals(item.Type.TypeId, "MyObjectBuilder_Ore", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (!includeStone && string.Equals(item.Type.SubtypeId, "Stone", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                total += (double)item.Amount;
+            }
+        }
+    }
+
+    return total;
 }
 
 bool CheckStuckInLane()
