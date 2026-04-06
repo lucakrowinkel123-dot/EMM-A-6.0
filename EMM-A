@@ -68,6 +68,8 @@ int noOreGainTicks = 0;
 const int noOreGainTickLimit = 20;
 const double autoDepthNoGainMeters = 2.0;
 const double autoDepthExtraCap = 200.0;
+int oreSampleTickCounter = 0;
+const int oreSampleIntervalTicks = 6;
 double TOFFR = 0; // target offset Right (m)
 double TOFFU = 0; // target offset Up (m)
 double TOFFF = 0; // target offset Forward (m)
@@ -674,6 +676,7 @@ void ResetDepthAutoTracker()
     lastOreSnapshot = GetOreAmount(depthMode == DepthMode.OrePlusStone);
     lastOreGainDepth = 0;
     noOreGainTicks = 0;
+    oreSampleTickCounter = 0;
 }
 
 double GetLaneProgressDepth()
@@ -694,18 +697,23 @@ bool ShouldFinishDrillForward()
     if (depthMode == DepthMode.Default)
         return depthProgress >= laneDepth || IsAtTargetPosition(targetPosition);
 
-    bool includeStone = depthMode == DepthMode.OrePlusStone;
-    double oreNow = GetOreAmount(includeStone);
+    oreSampleTickCounter++;
+    if (oreSampleTickCounter >= oreSampleIntervalTicks)
+    {
+        oreSampleTickCounter = 0;
+        bool includeStone = depthMode == DepthMode.OrePlusStone;
+        double oreNow = GetOreAmount(includeStone);
 
-    if (oreNow > lastOreSnapshot + 0.01)
-    {
-        lastOreSnapshot = oreNow;
-        lastOreGainDepth = depthProgress;
-        noOreGainTicks = 0;
-    }
-    else if (depthProgress >= laneDepth && (depthProgress - lastOreGainDepth) >= autoDepthNoGainMeters)
-    {
-        noOreGainTicks++;
+        if (oreNow > lastOreSnapshot + 0.01)
+        {
+            lastOreSnapshot = oreNow;
+            lastOreGainDepth = depthProgress;
+            noOreGainTicks = 0;
+        }
+        else if (depthProgress >= laneDepth && (depthProgress - lastOreGainDepth) >= autoDepthNoGainMeters)
+        {
+            noOreGainTicks++;
+        }
     }
 
     if (depthProgress >= laneDepth + autoDepthExtraCap)
@@ -716,17 +724,17 @@ bool ShouldFinishDrillForward()
 
 double GetOreAmount(bool includeStone)
 {
-    List<IMyTerminalBlock> blocks = new List<IMyTerminalBlock>();
-    GridTerminalSystem.GetBlocksOfType(blocks, b => b.CubeGrid.EntityId == Me.CubeGrid.EntityId && b.HasInventory);
-
     double total = 0;
     List<MyInventoryItem> items = new List<MyInventoryItem>();
-    foreach (var block in blocks)
+    foreach (var drill in drills)
     {
-        int invCount = block.InventoryCount;
+        if (drill == null || !drill.IsFunctional)
+            continue;
+
+        int invCount = drill.InventoryCount;
         for (int i = 0; i < invCount; i++)
         {
-            var inv = block.GetInventory(i);
+            var inv = drill.GetInventory(i);
             if (inv == null)
                 continue;
             items.Clear();
