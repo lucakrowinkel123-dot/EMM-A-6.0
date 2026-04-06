@@ -67,7 +67,9 @@ double lastOreGainDepth = 0;
 int noOreGainTicks = 0;
 const int noOreGainTickLimit = 20;
 const double autoDepthNoGainMeters = 2.0;
-const double autoDepthExtraCap = 200.0;
+// Keep the forward point far away in auto-depth modes so position-control slowdown
+// doesn't kick in too early and accidentally trigger stuck protection.
+const double autoDepthExtraCap = 2000.0;
 int oreSampleTickCounter = 0;
 const int oreSampleIntervalTicks = 6;
 double TOFFR = 0; // target offset Right (m)
@@ -205,6 +207,19 @@ void Move ()
         thrust.Reset();
         if (aligned)
             gyros.Reset();
+        return;
+    }
+
+    if (miningEnabled && miningState == MiningState.DrillForward)
+    {
+        Vector3D velDir = desiredForward;
+        if (velDir.LengthSquared() > 0.001)
+            velDir = Vector3D.Normalize(velDir);
+        else
+            velDir = rc.WorldMatrix.Forward;
+
+        double drillSpeed = activeMaxSpeed > 0 ? activeMaxSpeed : SPEEDF;
+        thrust.ApplyAccel(thrust.ControlVelocity(velDir * drillSpeed));
         return;
     }
 
